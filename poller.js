@@ -1,51 +1,62 @@
 import { google } from "googleapis";
-import "dotenv/config"; // Keep for local development
 import fetch from "node-fetch";
-import { Storage } from "@google-cloud/storage"; // Import GCS library
+import { Storage } from "@google-cloud/storage";
 
 // --- Configuration ---
-const SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]; // Yes, this scope is sufficient for listing and exporting Google Sheets as CSV.
+const SCOPES = ["https://www.googleapis.com/auth/drive.readonly"];
 
-// Determine if running locally or in a Google Cloud environment
-// Cloud Functions set FUNCTION_NAME, Cloud Run sets K_SERVICE.
-const IS_CLOUD_ENVIRONMENT = process.env.FUNCTION_NAME;
-const isLocal = !IS_CLOUD_ENVIRONMENT;
-
-const POLL_INTERVAL_SECONDS = 30; // Only used for local setInterval
+// Google Auth client setup:
+// For cloud, it automatically uses the Cloud Function's default service account.
 const auth = new google.auth.GoogleAuth({
   scopes: SCOPES,
-  ...(isLocal && { keyFile: process.env.CREDENTIALS_PATH }),
 });
 
+// GCS Client and Bucket/File names
 const storage = new Storage();
-const GCS_BUCKET_NAME = process.env.ASSETS_BUCKET_NAME || "tkd_assets"; // Use env var for cloud, fallback to literal for clarity
+const GCS_BUCKET_NAME = process.env.ASSETS_BUCKET_NAME; // Must be set as an environment variable in Cloud Function
 const LAST_CHECKED_FILE_NAME = "last_checked_time.txt";
 
 const SHARED_FOLDER_ID = process.env.SHARED_FOLDER_ID; // Must be set as an environment variable in Cloud Function
-const PROCESSOR_FUNCTION_URL = isLocal
-  ? process.env.LOCAL_URL // For local testing against a local processor
-  : process.env.PROCESSOR_FUNCTION_URL; // The HTTP trigger URL of your deployed processor CF
+const PROCESSOR_FUNCTION_URL = process.env.PROCESSOR_FUNCTION_URL; // The HTTP trigger URL of your deployed processor CF
 
 // Validate critical environment variables
+// For Cloud Functions, these checks are typically done at deployment or startup.
+// Instead of throwing errors that might crash the function, we'll log them.
 if (!SHARED_FOLDER_ID) {
-  throw new Error("SHARED_FOLDER_ID environment variable is not set.");
+  console.error("SHARED_FOLDER_ID environment variable is not set.");
 }
 if (!PROCESSOR_FUNCTION_URL) {
-  throw new Error("PROCESSOR_FUNCTION_URL environment variable is not set.");
+  console.error("PROCESSOR_FUNCTION_URL environment variable is not set.");
 }
 if (!GCS_BUCKET_NAME) {
-  throw new Error("GCS_BUCKET_NAME environment variable is not set.");
+  console.error("GCS_BUCKET_NAME environment variable is not set.");
 }
 
 /**
  * Polls Google Drive for new/modified Google Sheets, exports them as CSV,
  * and sends the data to a processor function. Persists last checked time in GCS.
  *
- * @param {object} [message] Pub/Sub message (only for Cloud Function trigger)
- * @param {object} [context] Pub/Sub context (only for Cloud Function trigger)
+ * This function is designed to be triggered by a Pub/Sub message via Eventarc.
+ * The Functions Framework handles the HTTP server and delivers the Pub/Sub message
+ * to this exported function.
+ *
+ * @param {object} message Pub/Sub message payload. For Eventarc-triggered
+ * Pub/Sub functions, this object contains the Pub/Sub
+ * message structure (e.g., `data`, `attributes`).
+ * @param {object} context Pub/Sub context (event, timestamp, eventType, resource).
+ * This will be an Eventarc context object for 2nd Gen.
  */
-export async function TKDPollDrive(message, context) {
+export async function pollDrive(message, context) {
   console.log(`[${new Date().toISOString()}] Polling started...`);
+
+  // It's good practice to ensure critical environment variables are set before proceeding.
+  // Although we log warnings above, a robust function might exit early here if they are missing.
+  if (!SHARED_FOLDER_ID || !PROCESSOR_FUNCTION_URL || !GCS_BUCKET_NAME) {
+    console.error(
+      "Skipping polling due to missing critical environment variables."
+    );
+    return; // Exit early if configuration is incomplete
+  }
 
   const bucket = storage.bucket(GCS_BUCKET_NAME);
   const file = bucket.file(LAST_CHECKED_FILE_NAME);
@@ -57,6 +68,8 @@ export async function TKDPollDrive(message, context) {
     lastCheckedTime = contents.toString().trim();
     console.log("Retrieved lastCheckedTime from GCS:", lastCheckedTime);
   } catch (err) {
+    // If the file doesn't exist (first run) or an error occurs,
+    // start from a very old date (epoch) to ensure all existing files are processed.
     if (err.code === 404) {
       // GCS returns 404 for non-existent files
       console.warn(
@@ -71,7 +84,7 @@ export async function TKDPollDrive(message, context) {
     lastCheckedTime = new Date(0).toISOString(); // Epoch time (January 1, 1970 UTC)
   }
 
-  const authClient = await auth.getClient();
+  const authClient = await auth.getClient(); // authClient is a google.auth.GoogleAuth instance
   const drive = google.drive({ version: "v3", auth: authClient });
 
   const baseQuery = `"${SHARED_FOLDER_ID}" in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false`;
@@ -108,7 +121,7 @@ export async function TKDPollDrive(message, context) {
         console.log(`Exporting & triggering processor for: ${file.name}`);
 
         const exportUrl = `https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/csv`;
-        const token = await authClient.getAccessToken();
+        const token = await authClient.getAccessToken(); // This gets a standard OAuth access token
 
         const csvRes = await fetch(exportUrl, {
           headers: {
@@ -126,25 +139,18 @@ export async function TKDPollDrive(message, context) {
         const csvText = await csvRes.text();
 
         // --- Authentication for Processor Function (if not public) ---
+        // If the PROCESSOR_FUNCTION_URL is public, no OIDC token is needed.
+        // It's only needed if the processor function is private (requires authentication).
         let headers = { "Content-Type": "application/json" };
-        if (IS_CLOUD_ENVIRONMENT) {
-          // If in cloud, generate OIDC token for secure invocation of Processor CF
-          const targetAudience = PROCESSOR_FUNCTION_URL;
-          // Use the Cloud Function's own service account to get the token
-          const oAuthClient = new google.auth.GoogleAuth({
-            scopes: ["https://www.googleapis.com/auth/cloud-platform"],
-            // This scope grants broad access needed for token generation;
-            // narrower scopes like 'https://www.googleapis.com/auth/userinfo.email' might also work.
-          });
-          const client = await oAuthClient.getClient();
-          const idToken = await client.idToken.getToken(targetAudience);
-          headers["Authorization"] = `Bearer ${idToken}`;
-        }
-        // else: For local, assuming LOCAL_URL is typically public or uses other local auth mechanism.
+        // if (IS_CLOUD_ENVIRONMENT) { // This block is removed if the target is public
+        //   const targetAudience = PROCESSOR_FUNCTION_URL;
+        //   const idToken = await authClient.idTokenProvider.getIdentityToken(targetAudience);
+        //   headers["Authorization"] = `Bearer ${idToken}`;
+        // }
 
         await fetch(PROCESSOR_FUNCTION_URL, {
           method: "POST",
-          headers: headers, // Use the dynamically created headers
+          headers: headers, // Use the dynamically created headers (now without Auth for public target)
           body: JSON.stringify({
             fileId: file.id,
             fileName: file.name,
@@ -153,7 +159,11 @@ export async function TKDPollDrive(message, context) {
         });
         console.log(`Successfully sent '${file.name}' to processor.`);
       }
-
+      // --- 2. Save new lastCheckedTime to GCS after successful processing ---
+      // We update the timestamp only if we successfully processed new files.
+      // Or, you could update it always after the query, even if no new files were found.
+      // For robust "polling for new files", update with the modifiedTime of the LATEST file
+      // or the current time after successful fetch.
       const newLastCheckedTime = new Date().toISOString(); // Using current time for simplicity
       await file.save(newLastCheckedTime); // Overwrites the file
       console.log("Updated lastCheckedTime in GCS to:", newLastCheckedTime);
@@ -167,7 +177,4 @@ export async function TKDPollDrive(message, context) {
   }
 }
 
-if (isLocal) {
-  console.log("Running in local mode. Starting polling interval.");
-  setInterval(TKDPollDrive, POLL_INTERVAL_SECONDS * 1000);
-}
+// No local execution hook as this script is now purely for cloud deployment.
